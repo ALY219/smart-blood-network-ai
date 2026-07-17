@@ -1,9 +1,9 @@
 import { initializeApp } from "firebase/app";
 import { getFirestore } from "firebase/firestore";
 
-// Your exact Firebase configuration
+// Your exact Firebase configuration (secured with environment variable)
 const firebaseConfig = {
-  apiKey: "AIzaSyAJaBDlCNuskIeWhzKylFu800D37ZICr0Q",
+  apiKey: process.env.EXPO_PUBLIC_FIREBASE_API_KEY,
   authDomain: "smart-blood-network-6a2f6.firebaseapp.com",
   projectId: "smart-blood-network-6a2f6",
   storageBucket: "smart-blood-network-6a2f6.firebasestorage.app",
