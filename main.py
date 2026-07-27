@@ -9,6 +9,7 @@ from google import genai
 from pydantic import BaseModel
 from app.models import EmergencyBloodRequest
 from dotenv import load_dotenv
+import chromadb
 
 load_dotenv()
 
@@ -32,6 +33,46 @@ db = firestore.client()
 api_key = os.getenv("GEMINI_API_KEY")
 client = genai.Client(api_key=api_key)
 GEMINI_MODEL = "gemini-2.5-flash"
+
+# ==========================================
+# RAG / ChromaDB Knowledge Base Setup
+# ==========================================
+chroma_client = chromadb.Client()
+knowledge_collection = chroma_client.get_or_create_collection(name="blood_knowledge")
+
+
+def seed_knowledge_base():
+    """Seeds local vector database with blood donation guidelines if empty."""
+    if knowledge_collection.count() == 0:
+        knowledge_collection.add(
+            documents=[
+                "O-negative is the universal red blood cell donor type and can be given to patients of any blood type in emergency situations.",
+                "Donors must wait at least 56 days (8 weeks) between whole blood donations to allow iron levels and red blood cells to fully recover.",
+                "AB-positive individuals are universal plasma donors and can receive red blood cells from any ABO blood group.",
+                "Standard donation eligibility requires donors to be aged 18 to 65, weigh at least 50 kg (110 lbs), and have a hemoglobin level above 12.5 g/dL."
+            ],
+            ids=["policy_01", "policy_02", "policy_03", "policy_04"]
+        )
+        print("✅ RAG Knowledge Base seeded successfully in ChromaDB!")
+
+
+def get_relevant_context(user_query: str, n_results: int = 2) -> str:
+    """Retrieves top matching policy document snippets for a user prompt."""
+    try:
+        results = knowledge_collection.query(query_texts=[user_query], n_results=n_results)
+        docs = results.get("documents", [[]])[0]
+        if not docs:
+            return "No specific policy guidelines found."
+        return "\n".join(f"- {doc}" for doc in docs)
+    except Exception as e:
+        print(f"[RAG RETRIEVAL ERROR] {e}")
+        return "No specific policy guidelines found."
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Seed ChromaDB knowledge base on server startup."""
+    seed_knowledge_base()
 
 
 class ChatRequest(BaseModel):
@@ -59,7 +100,7 @@ def filter_donors_by_blood_type(donor_pool: List[Dict[str, Any]], blood_group: s
 
 def build_prompt(request: EmergencyBloodRequest, donor_pool: list) -> str:
     """
-    Build structured prompt using string concatenation to avoid JSON string formatting conflicts with literal braces.
+    Build structured prompt using string concatenation to avoid JSON string formatting conflicts.
     """
     part1 = "Emergency Request: " + request.model_dump_json() + "\n"
     part2 = "Pre-filtered matching donors: " + json.dumps(donor_pool) + "\n\n"
@@ -84,7 +125,6 @@ def log_to_firestore(message: str, latency_ms: float, confidence: str = "n/a"):
 async def agentic_dispatch_logic(request: EmergencyBloodRequest):
     start_time = time.time()
     
-    # Safely extract target blood group/type regardless of field naming in Pydantic model
     target_blood_group = getattr(request, "blood_group", getattr(request, "blood_type", ""))
     
     try:
@@ -138,11 +178,10 @@ async def agentic_dispatch_logic(request: EmergencyBloodRequest):
 
 
 # ==========================================
-# ENDPOINT 1: High-Speed Async Chat Route
+# ENDPOINT 1: High-Speed Async RAG Chat Route
 # ==========================================
 @app.post("/chat")
 async def conversational_chat(request: ChatRequest, background_tasks: BackgroundTasks):
-    # Guard against empty/whitespace-only input
     clean_message = request.message.strip()
     if not clean_message:
         return {
@@ -152,17 +191,23 @@ async def conversational_chat(request: ChatRequest, background_tasks: Background
 
     start_time = time.time()
     try:
-        system_instruction = (
+        # 1. Semantic Retrieval from ChromaDB
+        retrieved_context = get_relevant_context(clean_message, n_results=2)
+
+        # 2. Build Grounded Prompt with Knowledge Context
+        grounded_instruction = (
             "You are the Smart Blood Network Assistant, an expert AI embedded inside a blood donation mobile app. "
             "Help the user answer questions about blood compatibility, donor guidelines, and system navigation. "
-            "Keep answers concise, accurate, and supportive. Use professional markdown lists if necessary.\n\n"
+            "Use the provided official policy context to accurately and concisely answer the question. "
+            "Keep answers concise, supportive, and clear.\n\n"
+            f"--- OFFICIAL POLICY CONTEXT ---\n{retrieved_context}\n-------------------------------\n\n"
             f"User Query: {clean_message}"
         )
 
-        # Non-blocking async call using client.aio
+        # 3. Non-blocking async call using client.aio
         response = await client.aio.models.generate_content(
             model=GEMINI_MODEL,
-            contents=system_instruction
+            contents=grounded_instruction
         )
         
         latency = round((time.time() - start_time) * 1000, 2)
@@ -170,9 +215,9 @@ async def conversational_chat(request: ChatRequest, background_tasks: Background
         # Async background log to Firestore
         background_tasks.add_task(
             log_to_firestore, 
-            f"Chat Session: {clean_message[:40]}...", 
+            f"Chat Session (RAG): {clean_message[:40]}...", 
             latency, 
-            "Interactive"
+            "Grounded"
         )
         
         return {"status": "success", "reply": response.text}
