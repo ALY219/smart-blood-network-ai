@@ -39,6 +39,41 @@ collection = get_chroma_collection()
 ai_client = get_gemini_client()
 
 
+# --- Contextual Query Rewriter (Day 16) ---
+def contextualize_query(chat_history: list, latest_question: str, llm_client) -> str:
+    """Transforms follow-up questions into standalone search queries using past chat history."""
+    if not chat_history:
+        return latest_question
+
+    # Extract up to the last 2 conversation turns (4 messages total)
+    recent_history = [
+        msg for msg in chat_history if msg["role"] in ["user", "assistant"]
+    ][-4:]
+
+    if not recent_history:
+        return latest_question
+
+    formatted_history = ""
+    for msg in recent_history:
+        formatted_history += f"{msg['role'].upper()}: {msg['content']}\n"
+
+    prompt = f"""Given the following chat history and a follow-up question, rephrase the follow-up question to be a STANDALONE search query that contains all necessary context for document retrieval.
+
+Do NOT answer the question, only rephrase it into a concise standalone search query.
+
+Chat History:
+{formatted_history}
+
+Follow-Up Question: {latest_question}
+
+Standalone Query:"""
+
+    response = llm_client.models.generate_content(
+        model="gemini-2.5-flash", contents=prompt
+    )
+    return response.text.strip()
+
+
 # --- Ingestion Utilities ---
 def read_file_text(file_path: str) -> str:
     ext = os.path.splitext(file_path)[1].lower()
@@ -187,7 +222,7 @@ with st.sidebar:
 
 # --- MAIN CHAT UI ---
 st.title("🩸 Blood Donation Knowledge Assistant")
-st.caption("Grounded QA using ChromaDB Vector Store & Gemini 2.5 Flash")
+st.caption("Grounded QA with Multi-Turn Conversational Memory & ChromaDB Vector Search")
 
 # Chat Session History Init
 if "messages" not in st.session_state:
@@ -204,15 +239,28 @@ for msg in st.session_state.messages:
 
 # Input Box
 if prompt := st.chat_input("Ask a question about blood donation regulations..."):
-    # Render user prompt
+    # 1. Render user prompt immediately
     st.chat_message("user").markdown(prompt)
+
+    # 2. Rephrase follow-up query using historical context BEFORE adding prompt to session
+    standalone_query = contextualize_query(
+        st.session_state.messages, prompt, ai_client
+    )
+
+    # Append original user prompt to chat history
     st.session_state.messages.append({"role": "user", "content": prompt})
 
-    # Generate Response
+    # 3. Generate Assistant Response
     with st.chat_message("assistant"):
         context, score_logs = get_relevant_context(
-            prompt, threshold=threshold
+            standalone_query, threshold=threshold
         )
+
+        # Prepend query rewriting metadata log if modified
+        if standalone_query != prompt:
+            score_logs.insert(
+                0, f"🔄 **Standalone Query:** `{standalone_query}`"
+            )
 
         with st.expander("🔍 View Search Scores & Distance Metrics"):
             for log in score_logs:
