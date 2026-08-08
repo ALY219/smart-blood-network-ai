@@ -1,7 +1,9 @@
 import os
+import re
 import chromadb
 from dotenv import load_dotenv
 from google import genai
+from rank_bm25 import BM25Okapi
 import streamlit as st
 
 # Load environment variables (.env)
@@ -9,7 +11,7 @@ load_dotenv()
 
 # --- Page Setup ---
 st.set_page_config(
-    page_title="RAG Knowledge Assistant",
+    page_title="RAG Knowledge Assistant (Hybrid Search)",
     page_icon="🩸",
     layout="wide",
 )
@@ -39,13 +41,16 @@ collection = get_chroma_collection()
 ai_client = get_gemini_client()
 
 
-# --- Contextual Query Rewriter (Day 16) ---
+# --- BM25 Tokenizer Utility ---
+def tokenize(text: str) -> list[str]:
+    return re.findall(r"\w+", text.lower())
+
+
+# --- Contextual Query Rewriter ---
 def contextualize_query(chat_history: list, latest_question: str, llm_client) -> str:
-    """Transforms follow-up questions into standalone search queries using past chat history."""
     if not chat_history:
         return latest_question
 
-    # Extract up to the last 2 conversation turns (4 messages total)
     recent_history = [
         msg for msg in chat_history if msg["role"] in ["user", "assistant"]
     ][-4:]
@@ -148,55 +153,111 @@ def ingest_knowledge_folder():
     return total_chunks
 
 
-# --- Retrieval Utility ---
-def get_relevant_context(query: str, threshold: float = 0.60):
-    results = collection.query(
+# --- Hybrid Retrieval Engine (BM25 + Chroma Vector + RRF) ---
+def get_hybrid_context(query: str, vector_threshold: float = 0.60, k: int = 60):
+    # 1. Fetch All Documents from ChromaDB to build in-memory BM25 index
+    all_data = collection.get(include=["documents", "metadatas"])
+    all_docs = all_data.get("documents", [])
+    all_metadatas = all_data.get("metadatas", [])
+    all_ids = all_data.get("ids", [])
+
+    if not all_docs:
+        return "", ["⚠️ Vector store is empty. Ingest documents first."]
+
+    # 2. Dense Vector Search (ChromaDB)
+    vector_results = collection.query(
         query_texts=[query],
-        n_results=5,
+        n_results=min(10, len(all_docs)),
         include=["documents", "distances", "metadatas"],
     )
 
-    docs = results["documents"][0] if results["documents"] else []
-    distances = results["distances"][0] if results["distances"] else []
-    metadatas = results["metadatas"][0] if results["metadatas"] else []
+    vec_docs = vector_results["documents"][0] if vector_results["documents"] else []
+    vec_ids = vector_results["ids"][0] if vector_results["ids"] else []
+    vec_distances = vector_results["distances"][0] if vector_results["distances"] else []
+    vec_metadatas = vector_results["metadatas"][0] if vector_results["metadatas"] else []
+
+    # Map Vector IDs to Ranks and Metadata
+    vec_rank_map = {}
+    doc_lookup = {}
+    meta_lookup = {}
+
+    for rank, (doc_id, doc, dist, meta) in enumerate(zip(vec_ids, vec_docs, vec_distances, vec_metadatas), start=1):
+        if dist <= vector_threshold:
+            vec_rank_map[doc_id] = rank
+            doc_lookup[doc_id] = doc
+            meta_lookup[doc_id] = meta
+
+    # 3. Sparse Keyword Search (BM25)
+    tokenized_corpus = [tokenize(doc) for doc in all_docs]
+    bm25 = BM25Okapi(tokenized_corpus)
+    tokenized_query = tokenize(query)
+    bm25_scores = bm25.get_scores(tokenized_query)
+
+    # Sort documents by BM25 score descending
+    bm25_ranked_indices = sorted(
+        range(len(bm25_scores)), key=lambda i: bm25_scores[i], reverse=True
+    )
+
+    bm25_rank_map = {}
+    for rank, idx in enumerate(bm25_ranked_indices[:10], start=1):
+        if bm25_scores[idx] > 0:  # Only include non-zero keyword matches
+            doc_id = all_ids[idx]
+            bm25_rank_map[doc_id] = rank
+            doc_lookup[doc_id] = all_docs[idx]
+            meta_lookup[doc_id] = all_metadatas[idx]
+
+    # 4. Reciprocal Rank Fusion (RRF)
+    all_candidate_ids = set(vec_rank_map.keys()).union(set(bm25_rank_map.keys()))
+    rrf_scores = {}
+
+    for doc_id in all_candidate_ids:
+        score = 0.0
+        if doc_id in vec_rank_map:
+            score += 1.0 / (k + vec_rank_map[doc_id])
+        if doc_id in bm25_rank_map:
+            score += 1.0 / (k + bm25_rank_map[doc_id])
+        rrf_scores[doc_id] = score
+
+    # Sort by highest RRF score
+    sorted_candidates = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
 
     filtered_chunks = []
     score_logs = []
 
-    for i, (doc, dist, meta) in enumerate(zip(docs, distances, metadatas)):
+    for doc_id, rrf_score in sorted_candidates[:5]:
+        doc = doc_lookup[doc_id]
+        meta = meta_lookup[doc_id]
         source = meta.get("source", "unknown_doc")
-        chunk_id = meta.get("chunk_id", meta.get("chunk", i + 1))
-        passed = dist <= threshold
+        chunk_id = meta.get("chunk_id", 1)
 
-        status = "✅ INJECTED" if passed else "❌ IGNORED"
+        vec_rank_str = f"Rank {vec_rank_map[doc_id]}" if doc_id in vec_rank_map else "N/A"
+        bm25_rank_str = f"Rank {bm25_rank_map[doc_id]}" if doc_id in bm25_rank_map else "N/A"
+
         score_logs.append(
-            f"**{status}** | Distance: `{dist:.4f}` | Source: `{source}` (Chunk {chunk_id})"
+            f"⚡ **RRF Score:** `{rrf_score:.5f}` | **Vector:** `{vec_rank_str}` | **BM25:** `{bm25_rank_str}` | Source: `{source}` (Chunk {chunk_id})"
         )
 
-        if passed:
-            formatted_chunk = f"[Source: {source} | Chunk {chunk_id}]\n{doc}"
-            filtered_chunks.append(formatted_chunk)
+        formatted_chunk = f"[Source: {source} | Chunk {chunk_id}]\n{doc}"
+        filtered_chunks.append(formatted_chunk)
 
     return "\n\n---\n\n".join(filtered_chunks), score_logs
 
 
 # --- SIDEBAR CONTROLS ---
 with st.sidebar:
-    st.title("⚙️ RAG Settings")
+    st.title("⚙️ Hybrid RAG Settings")
 
-    # Interactive Threshold Slider
     threshold = st.slider(
-        "Distance Threshold (Cosine)",
+        "Vector Distance Cutoff (Cosine)",
         min_value=0.10,
         max_value=1.20,
         value=0.60,
         step=0.05,
-        help="Scores lower than or equal to this threshold are injected into Gemini's context.",
+        help="Filters out weak semantic vector matches before RRF fusion.",
     )
 
     st.divider()
 
-    # Upload & Ingest UI
     st.subheader("📄 Upload Knowledge Files")
     uploaded_files = st.file_uploader(
         "Add .pdf or .txt files", type=["pdf", "txt"], accept_multiple_files=True
@@ -222,52 +283,44 @@ with st.sidebar:
 
 # --- MAIN CHAT UI ---
 st.title("🩸 Blood Donation Knowledge Assistant")
-st.caption("Grounded QA with Multi-Turn Conversational Memory & ChromaDB Vector Search")
+st.caption("Hybrid Search Engine: BM25 Keyword Search + ChromaDB Vector Search via Reciprocal Rank Fusion (RRF)")
 
-# Chat Session History Init
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# Display previous messages
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
         if "score_logs" in msg and msg["score_logs"]:
-            with st.expander("🔍 View Search Scores & Distance Metrics"):
+            with st.expander("🔍 View Hybrid Search & RRF Metrics"):
                 for log in msg["score_logs"]:
                     st.markdown(log)
 
-# Input Box
 if prompt := st.chat_input("Ask a question about blood donation regulations..."):
-    # 1. Render user prompt immediately
     st.chat_message("user").markdown(prompt)
 
-    # 2. Rephrase follow-up query using historical context BEFORE adding prompt to session
     standalone_query = contextualize_query(
         st.session_state.messages, prompt, ai_client
     )
 
-    # Append original user prompt to chat history
     st.session_state.messages.append({"role": "user", "content": prompt})
 
-    # 3. Generate Assistant Response
     with st.chat_message("assistant"):
-        context, score_logs = get_relevant_context(
-            standalone_query, threshold=threshold
+        context, score_logs = get_hybrid_context(
+            standalone_query, vector_threshold=threshold
         )
 
-        # Prepend query rewriting metadata log if modified
         if standalone_query != prompt:
             score_logs.insert(
                 0, f"🔄 **Standalone Query:** `{standalone_query}`"
             )
 
-        with st.expander("🔍 View Search Scores & Distance Metrics"):
+        with st.expander("🔍 View Hybrid Search & RRF Metrics"):
             for log in score_logs:
                 st.markdown(log)
 
         if not context:
-            answer = "⚠️ **No context met the distance threshold.** I don't have enough relevant official context to answer this question."
+            answer = "⚠️ **No context met the hybrid threshold.** I don't have enough relevant official context to answer this question."
             st.warning(answer)
         else:
             rag_prompt = f"""
