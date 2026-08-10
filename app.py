@@ -4,6 +4,7 @@ import chromadb
 from dotenv import load_dotenv
 from google import genai
 from rank_bm25 import BM25Okapi
+from sentence_transformers import CrossEncoder
 import streamlit as st
 
 # Load environment variables (.env)
@@ -11,7 +12,7 @@ load_dotenv()
 
 # --- Page Setup ---
 st.set_page_config(
-    page_title="RAG Knowledge Assistant (Hybrid Search)",
+    page_title="RAG Knowledge Assistant (HyDE Retrieval)",
     page_icon="🩸",
     layout="wide",
 )
@@ -37,8 +38,14 @@ def get_gemini_client():
     return genai.Client()
 
 
+@st.cache_resource
+def get_reranker():
+    return CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+
+
 collection = get_chroma_collection()
 ai_client = get_gemini_client()
+reranker_model = get_reranker()
 
 
 # --- BM25 Tokenizer Utility ---
@@ -79,6 +86,23 @@ Standalone Query:"""
     return response.text.strip()
 
 
+# --- HyDE Generator Utility ---
+def generate_hypothetical_document(query: str, llm_client) -> str:
+    """Generates an authoritative passage answering the query to align dense vector space semantics."""
+    hyde_prompt = f"""Please write a detailed, authoritative paragraph from an official medical regulation or donor handbook that directly answers the following query.
+
+Do not write meta-commentary, introductions, or disclaimers. Write directly as if it were an excerpt from the reference manual.
+
+Query: {query}
+
+Hypothetical Excerpt:"""
+
+    response = llm_client.models.generate_content(
+        model="gemini-2.5-flash", contents=hyde_prompt
+    )
+    return response.text.strip()
+
+
 # --- Ingestion Utilities ---
 def read_file_text(file_path: str) -> str:
     ext = os.path.splitext(file_path)[1].lower()
@@ -98,9 +122,7 @@ def read_file_text(file_path: str) -> str:
     return ""
 
 
-def chunk_text(
-    text: str, chunk_size: int = 300, overlap: int = 50
-) -> list[str]:
+def chunk_text(text: str, chunk_size: int, overlap: int) -> list[str]:
     chunks = []
     start = 0
     text_length = len(text)
@@ -124,7 +146,7 @@ def ingest_knowledge_folder():
     if not files:
         return 0
 
-    total_chunks = 0
+    total_child_chunks = 0
     for filename in files:
         file_path = os.path.join(KNOWLEDGE_DIR, filename)
         ext = os.path.splitext(filename)[1].lower()
@@ -132,30 +154,47 @@ def ingest_knowledge_folder():
         if not raw_text.strip():
             continue
 
-        chunks = chunk_text(raw_text, chunk_size=300, overlap=50)
-        if not chunks:
-            continue
+        parent_chunks = chunk_text(raw_text, chunk_size=600, overlap=100)
 
-        ids = [f"{filename}_chunk_{i+1}" for i in range(len(chunks))]
-        metadatas = [
-            {
-                "source": filename,
-                "file_type": ext,
-                "chunk_id": i + 1,
-                "total_chunks": len(chunks),
-            }
-            for i in range(len(chunks))
-        ]
+        child_documents = []
+        child_ids = []
+        child_metadatas = []
 
-        collection.upsert(documents=chunks, ids=ids, metadatas=metadatas)
-        total_chunks += len(chunks)
+        for p_idx, parent_text in enumerate(parent_chunks, start=1):
+            parent_id = f"{filename}_parent_{p_idx}"
+            child_chunks = chunk_text(parent_text, chunk_size=150, overlap=30)
 
-    return total_chunks
+            for c_idx, child_text in enumerate(child_chunks, start=1):
+                child_id = f"{parent_id}_child_{c_idx}"
+                child_ids.append(child_id)
+                child_documents.append(child_text)
+                child_metadatas.append(
+                    {
+                        "source": filename,
+                        "file_type": ext,
+                        "parent_id": parent_id,
+                        "parent_text": parent_text,
+                        "child_idx": c_idx,
+                    }
+                )
+
+        if child_documents:
+            collection.upsert(
+                documents=child_documents, ids=child_ids, metadatas=child_metadatas
+            )
+            total_child_chunks += len(child_documents)
+
+    return total_child_chunks
 
 
-# --- Hybrid Retrieval Engine (BM25 + Chroma Vector + RRF) ---
-def get_hybrid_context(query: str, vector_threshold: float = 0.60, k: int = 60):
-    # 1. Fetch All Documents from ChromaDB to build in-memory BM25 index
+# --- HyDE + Parent-Child Retrieval Engine ---
+def get_hyde_context(
+    query: str,
+    use_hyde: bool = True,
+    vector_threshold: float = 0.60,
+    top_k_rerank: int = 3,
+    k: int = 60,
+):
     all_data = collection.get(include=["documents", "metadatas"])
     all_docs = all_data.get("documents", [])
     all_metadatas = all_data.get("metadatas", [])
@@ -164,10 +203,20 @@ def get_hybrid_context(query: str, vector_threshold: float = 0.60, k: int = 60):
     if not all_docs:
         return "", ["⚠️ Vector store is empty. Ingest documents first."]
 
-    # 2. Dense Vector Search (ChromaDB)
+    score_logs = []
+
+    # 1. Generate HyDE Hypothetical Document for Vector Search
+    if use_hyde:
+        hypothetical_doc = generate_hypothetical_document(query, ai_client)
+        vector_query_text = hypothetical_doc
+        score_logs.append(f"💡 **HyDE Passage:** *\"{hypothetical_doc}\"*")
+    else:
+        vector_query_text = query
+
+    # 2. Dense Vector Search on Child Chunks using HyDE Text
     vector_results = collection.query(
-        query_texts=[query],
-        n_results=min(10, len(all_docs)),
+        query_texts=[vector_query_text],
+        n_results=min(15, len(all_docs)),
         include=["documents", "distances", "metadatas"],
     )
 
@@ -176,40 +225,40 @@ def get_hybrid_context(query: str, vector_threshold: float = 0.60, k: int = 60):
     vec_distances = vector_results["distances"][0] if vector_results["distances"] else []
     vec_metadatas = vector_results["metadatas"][0] if vector_results["metadatas"] else []
 
-    # Map Vector IDs to Ranks and Metadata
     vec_rank_map = {}
-    doc_lookup = {}
+    child_lookup = {}
     meta_lookup = {}
 
     for rank, (doc_id, doc, dist, meta) in enumerate(zip(vec_ids, vec_docs, vec_distances, vec_metadatas), start=1):
         if dist <= vector_threshold:
             vec_rank_map[doc_id] = rank
-            doc_lookup[doc_id] = doc
+            child_lookup[doc_id] = doc
             meta_lookup[doc_id] = meta
 
-    # 3. Sparse Keyword Search (BM25)
+    # 3. BM25 Search on Child Chunks using Raw Query Keywords
     tokenized_corpus = [tokenize(doc) for doc in all_docs]
     bm25 = BM25Okapi(tokenized_corpus)
     tokenized_query = tokenize(query)
     bm25_scores = bm25.get_scores(tokenized_query)
 
-    # Sort documents by BM25 score descending
     bm25_ranked_indices = sorted(
         range(len(bm25_scores)), key=lambda i: bm25_scores[i], reverse=True
     )
 
     bm25_rank_map = {}
-    for rank, idx in enumerate(bm25_ranked_indices[:10], start=1):
-        if bm25_scores[idx] > 0:  # Only include non-zero keyword matches
+    for rank, idx in enumerate(bm25_ranked_indices[:15], start=1):
+        if bm25_scores[idx] > 0:
             doc_id = all_ids[idx]
             bm25_rank_map[doc_id] = rank
-            doc_lookup[doc_id] = all_docs[idx]
+            child_lookup[doc_id] = all_docs[idx]
             meta_lookup[doc_id] = all_metadatas[idx]
 
-    # 4. Reciprocal Rank Fusion (RRF)
+    # 4. RRF Fusion on Child Matches
     all_candidate_ids = set(vec_rank_map.keys()).union(set(bm25_rank_map.keys()))
-    rrf_scores = {}
+    if not all_candidate_ids:
+        return "", score_logs + ["⚠️ No child chunks matched the retrieval filters."]
 
+    rrf_scores = {}
     for doc_id in all_candidate_ids:
         score = 0.0
         if doc_id in vec_rank_map:
@@ -218,26 +267,46 @@ def get_hybrid_context(query: str, vector_threshold: float = 0.60, k: int = 60):
             score += 1.0 / (k + bm25_rank_map[doc_id])
         rrf_scores[doc_id] = score
 
-    # Sort by highest RRF score
-    sorted_candidates = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
+    top_child_candidates = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)[:10]
+
+    # 5. Map Child Candidates to Unique Parent Chunks
+    unique_parents = {}
+    for child_id, rrf_score in top_child_candidates:
+        meta = meta_lookup[child_id]
+        parent_id = meta.get("parent_id")
+        parent_text = meta.get("parent_text")
+        source = meta.get("source", "unknown_doc")
+
+        if parent_id not in unique_parents:
+            unique_parents[parent_id] = {
+                "parent_id": parent_id,
+                "parent_text": parent_text,
+                "source": source,
+                "max_rrf_score": rrf_score,
+                "matched_child_id": child_id,
+            }
+
+    parent_list = list(unique_parents.values())
+
+    # 6. Cross-Encoder Re-Ranking over Parent Passages
+    candidate_pairs = [(query, p["parent_text"]) for p in parent_list]
+    cross_encoder_scores = reranker_model.predict(candidate_pairs)
+
+    for p_item, ce_score in zip(parent_list, cross_encoder_scores):
+        p_item["ce_score"] = float(ce_score)
+
+    final_parents = sorted(parent_list, key=lambda x: x["ce_score"], reverse=True)[:top_k_rerank]
 
     filtered_chunks = []
-    score_logs = []
-
-    for doc_id, rrf_score in sorted_candidates[:5]:
-        doc = doc_lookup[doc_id]
-        meta = meta_lookup[doc_id]
-        source = meta.get("source", "unknown_doc")
-        chunk_id = meta.get("chunk_id", 1)
-
-        vec_rank_str = f"Rank {vec_rank_map[doc_id]}" if doc_id in vec_rank_map else "N/A"
-        bm25_rank_str = f"Rank {bm25_rank_map[doc_id]}" if doc_id in bm25_rank_map else "N/A"
+    for p_item in final_parents:
+        source = p_item["source"]
+        p_id = p_item["parent_id"]
 
         score_logs.append(
-            f"⚡ **RRF Score:** `{rrf_score:.5f}` | **Vector:** `{vec_rank_str}` | **BM25:** `{bm25_rank_str}` | Source: `{source}` (Chunk {chunk_id})"
+            f"🎯 **Parent Re-Rank Score:** `{p_item['ce_score']:.4f}` | Max Child RRF: `{p_item['max_rrf_score']:.5f}` | Source: `{source}` (`{p_id}`)"
         )
 
-        formatted_chunk = f"[Source: {source} | Chunk {chunk_id}]\n{doc}"
+        formatted_chunk = f"[Source: {source} | Parent ID: {p_id}]\n{p_item['parent_text']}"
         filtered_chunks.append(formatted_chunk)
 
     return "\n\n---\n\n".join(filtered_chunks), score_logs
@@ -245,15 +314,30 @@ def get_hybrid_context(query: str, vector_threshold: float = 0.60, k: int = 60):
 
 # --- SIDEBAR CONTROLS ---
 with st.sidebar:
-    st.title("⚙️ Hybrid RAG Settings")
+    st.title("⚙️ HyDE & Two-Stage Settings")
+
+    enable_hyde = st.toggle(
+        "Enable HyDE (Hypothetical Embeddings)",
+        value=True,
+        help="Generates a fake answering passage to align vector search with target documents.",
+    )
 
     threshold = st.slider(
-        "Vector Distance Cutoff (Cosine)",
+        "Child Vector Distance Cutoff (Cosine)",
         min_value=0.10,
         max_value=1.20,
         value=0.60,
         step=0.05,
-        help="Filters out weak semantic vector matches before RRF fusion.",
+        help="Filters weak child vector matches before mapping to Parent context.",
+    )
+
+    top_k_rerank = st.slider(
+        "Final Parent Chunks for LLM",
+        min_value=1,
+        max_value=5,
+        value=3,
+        step=1,
+        help="Number of full Parent chunks supplied to Gemini after Cross-Encoder re-ranking.",
     )
 
     st.divider()
@@ -271,9 +355,9 @@ with st.sidebar:
         st.success(f"Saved {len(uploaded_files)} file(s) to 'knowledge/'!")
 
     if st.button("🚀 Re-Index Knowledge Base", use_container_width=True):
-        with st.spinner("Processing documents into ChromaDB..."):
+        with st.spinner("Building Parent-Child Chunks in ChromaDB..."):
             count = ingest_knowledge_folder()
-            st.success(f"Ingestion Complete! {count} total chunks stored.")
+            st.success(f"Ingestion Complete! {count} child chunks indexed.")
 
     st.divider()
 
@@ -283,7 +367,7 @@ with st.sidebar:
 
 # --- MAIN CHAT UI ---
 st.title("🩸 Blood Donation Knowledge Assistant")
-st.caption("Hybrid Search Engine: BM25 Keyword Search + ChromaDB Vector Search via Reciprocal Rank Fusion (RRF)")
+st.caption("Day 20 Architecture: HyDE Query Expansion ➔ Small Child Match ➔ Parent Context ➔ Cross-Encoder Re-Ranking")
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -292,7 +376,7 @@ for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
         if "score_logs" in msg and msg["score_logs"]:
-            with st.expander("🔍 View Hybrid Search & RRF Metrics"):
+            with st.expander("🔍 View HyDE & Retrieval Metrics"):
                 for log in msg["score_logs"]:
                     st.markdown(log)
 
@@ -306,8 +390,11 @@ if prompt := st.chat_input("Ask a question about blood donation regulations...")
     st.session_state.messages.append({"role": "user", "content": prompt})
 
     with st.chat_message("assistant"):
-        context, score_logs = get_hybrid_context(
-            standalone_query, vector_threshold=threshold
+        context, score_logs = get_hyde_context(
+            standalone_query,
+            use_hyde=enable_hyde,
+            vector_threshold=threshold,
+            top_k_rerank=top_k_rerank,
         )
 
         if standalone_query != prompt:
@@ -315,19 +402,19 @@ if prompt := st.chat_input("Ask a question about blood donation regulations...")
                 0, f"🔄 **Standalone Query:** `{standalone_query}`"
             )
 
-        with st.expander("🔍 View Hybrid Search & RRF Metrics"):
+        with st.expander("🔍 View HyDE & Retrieval Metrics"):
             for log in score_logs:
                 st.markdown(log)
 
         if not context:
-            answer = "⚠️ **No context met the hybrid threshold.** I don't have enough relevant official context to answer this question."
+            answer = "⚠️ **No context met the retrieval threshold.** I don't have enough relevant official context to answer this question."
             st.warning(answer)
         else:
             rag_prompt = f"""
 Answer the user's question accurately using ONLY the context provided below.
 
 Rules:
-1. Include inline citations (e.g., [Source: donor_manual.txt | Chunk 2]) immediately after mentioning facts from that source.
+1. Include inline citations (e.g., [Source: donor_manual.txt | Parent ID: donor_manual.txt_parent_1]) immediately after mentioning facts from that source.
 2. Do not use outside knowledge. If the context does not contain the answer, state that the information is unavailable in the provided documents.
 
 Context:
