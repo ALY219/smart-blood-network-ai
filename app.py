@@ -12,7 +12,7 @@ load_dotenv()
 
 # --- Page Setup ---
 st.set_page_config(
-    page_title="RAG Knowledge Assistant (HyDE Retrieval)",
+    page_title="RAG Knowledge Assistant (Corrective RAG)",
     page_icon="🩸",
     layout="wide",
 )
@@ -86,9 +86,33 @@ Standalone Query:"""
     return response.text.strip()
 
 
+# --- Multi-Query Generator Utility ---
+def generate_multi_queries(query: str, llm_client, num_queries: int = 3) -> list[str]:
+    multi_prompt = f"""You are an AI assistant helping optimize search queries for a document retrieval engine.
+Generate {num_queries} different versions or alternative perspectives of the user query below to retrieve relevant documents from a knowledge base.
+
+Provide each variation on a new line. Do not number them or add preambles.
+
+Original Query: {query}
+
+Query Variations:"""
+
+    response = llm_client.models.generate_content(
+        model="gemini-2.5-flash", contents=multi_prompt
+    )
+
+    variations = [q.strip("- ").strip() for q in response.text.strip().split("\n") if q.strip()]
+
+    all_queries = [query]
+    for v in variations:
+        if v.lower() != query.lower() and v not in all_queries:
+            all_queries.append(v)
+
+    return all_queries[: num_queries + 1]
+
+
 # --- HyDE Generator Utility ---
 def generate_hypothetical_document(query: str, llm_client) -> str:
-    """Generates an authoritative passage answering the query to align dense vector space semantics."""
     hyde_prompt = f"""Please write a detailed, authoritative paragraph from an official medical regulation or donor handbook that directly answers the following query.
 
 Do not write meta-commentary, introductions, or disclaimers. Write directly as if it were an excerpt from the reference manual.
@@ -187,11 +211,14 @@ def ingest_knowledge_folder():
     return total_child_chunks
 
 
-# --- HyDE + Parent-Child Retrieval Engine ---
-def get_hyde_context(
+# --- Corrective RAG (CRAG) Engine ---
+def get_crag_context(
     query: str,
+    use_multi_query: bool = True,
     use_hyde: bool = True,
     vector_threshold: float = 0.60,
+    crag_high_threshold: float = 0.0,
+    crag_low_threshold: float = -2.5,
     top_k_rerank: int = 3,
     k: int = 60,
 ):
@@ -201,75 +228,74 @@ def get_hyde_context(
     all_ids = all_data.get("ids", [])
 
     if not all_docs:
-        return "", ["⚠️ Vector store is empty. Ingest documents first."]
+        return "", "INCORRECT", ["⚠️ Vector store is empty. Ingest documents first."]
 
     score_logs = []
 
-    # 1. Generate HyDE Hypothetical Document for Vector Search
-    if use_hyde:
-        hypothetical_doc = generate_hypothetical_document(query, ai_client)
-        vector_query_text = hypothetical_doc
-        score_logs.append(f"💡 **HyDE Passage:** *\"{hypothetical_doc}\"*")
+    # 1. Multi-Query Expansion
+    if use_multi_query:
+        queries = generate_multi_queries(query, ai_client, num_queries=3)
+        score_logs.append("🔀 **Multi-Query Variations:**")
+        for idx, q_var in enumerate(queries, start=1):
+            score_logs.append(f"  {idx}. `{q_var}`")
     else:
-        vector_query_text = query
+        queries = [query]
 
-    # 2. Dense Vector Search on Child Chunks using HyDE Text
-    vector_results = collection.query(
-        query_texts=[vector_query_text],
-        n_results=min(15, len(all_docs)),
-        include=["documents", "distances", "metadatas"],
-    )
+    tokenized_corpus = [tokenize(doc) for doc in all_docs]
+    bm25 = BM25Okapi(tokenized_corpus)
 
-    vec_docs = vector_results["documents"][0] if vector_results["documents"] else []
-    vec_ids = vector_results["ids"][0] if vector_results["ids"] else []
-    vec_distances = vector_results["distances"][0] if vector_results["distances"] else []
-    vec_metadatas = vector_results["metadatas"][0] if vector_results["metadatas"] else []
-
-    vec_rank_map = {}
+    child_rrf_accumulator = {}
     child_lookup = {}
     meta_lookup = {}
 
-    for rank, (doc_id, doc, dist, meta) in enumerate(zip(vec_ids, vec_docs, vec_distances, vec_metadatas), start=1):
-        if dist <= vector_threshold:
-            vec_rank_map[doc_id] = rank
-            child_lookup[doc_id] = doc
-            meta_lookup[doc_id] = meta
+    # 2. Multi-Stream Retrieval
+    for sub_query in queries:
+        search_vector_text = (
+            generate_hypothetical_document(sub_query, ai_client)
+            if use_hyde
+            else sub_query
+        )
 
-    # 3. BM25 Search on Child Chunks using Raw Query Keywords
-    tokenized_corpus = [tokenize(doc) for doc in all_docs]
-    bm25 = BM25Okapi(tokenized_corpus)
-    tokenized_query = tokenize(query)
-    bm25_scores = bm25.get_scores(tokenized_query)
+        vector_results = collection.query(
+            query_texts=[search_vector_text],
+            n_results=min(10, len(all_docs)),
+            include=["documents", "distances", "metadatas"],
+        )
 
-    bm25_ranked_indices = sorted(
-        range(len(bm25_scores)), key=lambda i: bm25_scores[i], reverse=True
-    )
+        vec_docs = vector_results["documents"][0] if vector_results["documents"] else []
+        vec_ids = vector_results["ids"][0] if vector_results["ids"] else []
+        vec_distances = vector_results["distances"][0] if vector_results["distances"] else []
+        vec_metadatas = vector_results["metadatas"][0] if vector_results["metadatas"] else []
 
-    bm25_rank_map = {}
-    for rank, idx in enumerate(bm25_ranked_indices[:15], start=1):
-        if bm25_scores[idx] > 0:
-            doc_id = all_ids[idx]
-            bm25_rank_map[doc_id] = rank
-            child_lookup[doc_id] = all_docs[idx]
-            meta_lookup[doc_id] = all_metadatas[idx]
+        for rank, (doc_id, doc, dist, meta) in enumerate(
+            zip(vec_ids, vec_docs, vec_distances, vec_metadatas), start=1
+        ):
+            if dist <= vector_threshold:
+                child_lookup[doc_id] = doc
+                meta_lookup[doc_id] = meta
+                child_rrf_accumulator[doc_id] = child_rrf_accumulator.get(doc_id, 0.0) + (1.0 / (k + rank))
 
-    # 4. RRF Fusion on Child Matches
-    all_candidate_ids = set(vec_rank_map.keys()).union(set(bm25_rank_map.keys()))
-    if not all_candidate_ids:
-        return "", score_logs + ["⚠️ No child chunks matched the retrieval filters."]
+        tokenized_sub_query = tokenize(sub_query)
+        bm25_scores = bm25.get_scores(tokenized_sub_query)
+        bm25_ranked_indices = sorted(
+            range(len(bm25_scores)), key=lambda i: bm25_scores[i], reverse=True
+        )
 
-    rrf_scores = {}
-    for doc_id in all_candidate_ids:
-        score = 0.0
-        if doc_id in vec_rank_map:
-            score += 1.0 / (k + vec_rank_map[doc_id])
-        if doc_id in bm25_rank_map:
-            score += 1.0 / (k + bm25_rank_map[doc_id])
-        rrf_scores[doc_id] = score
+        for rank, idx in enumerate(bm25_ranked_indices[:10], start=1):
+            if bm25_scores[idx] > 0:
+                doc_id = all_ids[idx]
+                child_lookup[doc_id] = all_docs[idx]
+                meta_lookup[doc_id] = all_metadatas[idx]
+                child_rrf_accumulator[doc_id] = child_rrf_accumulator.get(doc_id, 0.0) + (1.0 / (k + rank))
 
-    top_child_candidates = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)[:10]
+    if not child_rrf_accumulator:
+        return "", "INCORRECT", score_logs + ["⚠️ No child chunks passed distance thresholds."]
 
-    # 5. Map Child Candidates to Unique Parent Chunks
+    top_child_candidates = sorted(
+        child_rrf_accumulator.items(), key=lambda x: x[1], reverse=True
+    )[:12]
+
+    # 3. Map to Parent Chunks
     unique_parents = {}
     for child_id, rrf_score in top_child_candidates:
         meta = meta_lookup[child_id]
@@ -283,12 +309,11 @@ def get_hyde_context(
                 "parent_text": parent_text,
                 "source": source,
                 "max_rrf_score": rrf_score,
-                "matched_child_id": child_id,
             }
 
     parent_list = list(unique_parents.values())
 
-    # 6. Cross-Encoder Re-Ranking over Parent Passages
+    # 4. Cross-Encoder Evaluation & Scoring
     candidate_pairs = [(query, p["parent_text"]) for p in parent_list]
     cross_encoder_scores = reranker_model.predict(candidate_pairs)
 
@@ -296,6 +321,20 @@ def get_hyde_context(
         p_item["ce_score"] = float(ce_score)
 
     final_parents = sorted(parent_list, key=lambda x: x["ce_score"], reverse=True)[:top_k_rerank]
+    top_score = final_parents[0]["ce_score"] if final_parents else -999.0
+
+    # 5. CRAG Decision Routing
+    if top_score >= crag_high_threshold:
+        crag_status = "CORRECT"
+    elif top_score >= crag_low_threshold:
+        crag_status = "AMBIGUOUS"
+    else:
+        crag_status = "INCORRECT"
+
+    score_logs.append(f"🛡️ **CRAG Assessment:** `{crag_status}` (Top Cross-Encoder Score: `{top_score:.4f}`)")
+
+    if crag_status == "INCORRECT":
+        return "", crag_status, score_logs
 
     filtered_chunks = []
     for p_item in final_parents:
@@ -303,23 +342,38 @@ def get_hyde_context(
         p_id = p_item["parent_id"]
 
         score_logs.append(
-            f"🎯 **Parent Re-Rank Score:** `{p_item['ce_score']:.4f}` | Max Child RRF: `{p_item['max_rrf_score']:.5f}` | Source: `{source}` (`{p_id}`)"
+            f"🎯 **Parent Re-Rank Score:** `{p_item['ce_score']:.4f}` | Source: `{source}` (`{p_id}`)"
         )
-
         formatted_chunk = f"[Source: {source} | Parent ID: {p_id}]\n{p_item['parent_text']}"
         filtered_chunks.append(formatted_chunk)
 
-    return "\n\n---\n\n".join(filtered_chunks), score_logs
+    return "\n\n---\n\n".join(filtered_chunks), crag_status, score_logs
 
 
 # --- SIDEBAR CONTROLS ---
 with st.sidebar:
-    st.title("⚙️ HyDE & Two-Stage Settings")
+    st.title("⚙️ CRAG Architecture Settings")
 
-    enable_hyde = st.toggle(
-        "Enable HyDE (Hypothetical Embeddings)",
-        value=True,
-        help="Generates a fake answering passage to align vector search with target documents.",
+    enable_multi_query = st.toggle("Enable Multi-Query Expansion", value=True)
+    enable_hyde = st.toggle("Enable HyDE Transformation", value=True)
+
+    st.subheader("🛡️ CRAG Confidence Thresholds")
+    crag_high = st.slider(
+        "High Confidence Threshold (CORRECT)",
+        min_value=-2.0,
+        max_value=3.0,
+        value=0.0,
+        step=0.25,
+        help="Scores above this tier trigger full grounded answer generation.",
+    )
+
+    crag_low = st.slider(
+        "Low Confidence Cutoff (INCORRECT)",
+        min_value=-5.0,
+        max_value=0.0,
+        value=-2.5,
+        step=0.25,
+        help="Scores below this tier drop context to prevent hallucination.",
     )
 
     threshold = st.slider(
@@ -328,16 +382,10 @@ with st.sidebar:
         max_value=1.20,
         value=0.60,
         step=0.05,
-        help="Filters weak child vector matches before mapping to Parent context.",
     )
 
     top_k_rerank = st.slider(
-        "Final Parent Chunks for LLM",
-        min_value=1,
-        max_value=5,
-        value=3,
-        step=1,
-        help="Number of full Parent chunks supplied to Gemini after Cross-Encoder re-ranking.",
+        "Final Parent Chunks for LLM", min_value=1, max_value=5, value=3, step=1
     )
 
     st.divider()
@@ -367,7 +415,7 @@ with st.sidebar:
 
 # --- MAIN CHAT UI ---
 st.title("🩸 Blood Donation Knowledge Assistant")
-st.caption("Day 20 Architecture: HyDE Query Expansion ➔ Small Child Match ➔ Parent Context ➔ Cross-Encoder Re-Ranking")
+st.caption("Day 22 Architecture: Corrective RAG (CRAG) Guidance + Multi-Query + HyDE + Parent-Child Retrieval")
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -376,7 +424,7 @@ for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
         if "score_logs" in msg and msg["score_logs"]:
-            with st.expander("🔍 View HyDE & Retrieval Metrics"):
+            with st.expander("🔍 View CRAG Metrics & Evaluation Logs"):
                 for log in msg["score_logs"]:
                     st.markdown(log)
 
@@ -390,26 +438,51 @@ if prompt := st.chat_input("Ask a question about blood donation regulations...")
     st.session_state.messages.append({"role": "user", "content": prompt})
 
     with st.chat_message("assistant"):
-        context, score_logs = get_hyde_context(
+        context, crag_status, score_logs = get_crag_context(
             standalone_query,
+            use_multi_query=enable_multi_query,
             use_hyde=enable_hyde,
             vector_threshold=threshold,
+            crag_high_threshold=crag_high,
+            crag_low_threshold=crag_low,
             top_k_rerank=top_k_rerank,
         )
 
         if standalone_query != prompt:
-            score_logs.insert(
-                0, f"🔄 **Standalone Query:** `{standalone_query}`"
-            )
+            score_logs.insert(0, f"🔄 **Standalone Query:** `{standalone_query}`")
 
-        with st.expander("🔍 View HyDE & Retrieval Metrics"):
+        with st.expander("🔍 View CRAG Metrics & Evaluation Logs"):
             for log in score_logs:
                 st.markdown(log)
 
-        if not context:
-            answer = "⚠️ **No context met the retrieval threshold.** I don't have enough relevant official context to answer this question."
-            st.warning(answer)
-        else:
+        # Corrective Action Execution
+        if crag_status == "INCORRECT":
+            answer = "⚠️ **Corrective RAG Warning:** The retrieved context failed quality relevance thresholds. To avoid hallucination, I cannot provide an official answer based on the current documents."
+            st.error(answer)
+
+        elif crag_status == "AMBIGUOUS":
+            st.warning("⚠️ **Corrective RAG Notice:** Retrieval confidence is ambiguous. Answer generated with caution constraints.")
+            rag_prompt = f"""
+Answer the user's question using ONLY the provided context below.
+
+CRAG NOTICE: The provided context may only partially address the question.
+1. State clearly what is supported directly by the context.
+2. Explicitly highlight any missing or uncertain details that are not fully confirmed in the context.
+3. Include inline citations (e.g., [Source: donor_manual.txt | Parent ID: donor_manual.txt_parent_1]).
+
+Context:
+{context}
+
+User Question: {prompt}
+"""
+            with st.spinner("Thinking cautiously..."):
+                response = ai_client.models.generate_content(
+                    model="gemini-2.5-flash", contents=rag_prompt
+                )
+                answer = response.text
+            st.markdown(answer)
+
+        else:  # CORRECT
             rag_prompt = f"""
 Answer the user's question accurately using ONLY the context provided below.
 
@@ -427,7 +500,6 @@ User Question: {prompt}
                     model="gemini-2.5-flash", contents=rag_prompt
                 )
                 answer = response.text
-
             st.markdown(answer)
 
         st.session_state.messages.append(
